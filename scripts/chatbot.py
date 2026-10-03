@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 import requests
-from anthropic import Anthropic
+from anthropic import Anthropic, APIError
 
 # colorama makes ANSI colors work reliably in Windows terminals (PowerShell,
 # cmd.exe), which is why "You:"/"Bot:" plain text was hard to tell apart.
@@ -52,6 +52,20 @@ def ascii_banner(word: str) -> str:
 # real answers to get missed under pure top-1 retrieval.
 TOP_K = 3
 
+# If even the best-matching chunk scores below this, the question is
+# probably not covered by the FAQ at all, so we skip the Claude call
+# entirely rather than ask it to answer from weak/irrelevant context.
+# This is a rough starting point, not a calibrated value - watch the
+# "[retrieved: ...]" debug line during real use and raise or lower it
+# based on where good vs. bad matches actually land.
+MIN_SIMILARITY = 0.3
+
+# How many messages (user + assistant combined) to keep in conversation
+# history. Without a cap this list grows forever, which eventually blows
+# past the model's context window and makes every turn more expensive.
+# Kept as an even number so we always trim in full user/assistant pairs.
+MAX_HISTORY_MESSAGES = 20
+
 
 def load_faq_chunks() -> list[dict]:
     """Load the pre-computed FAQ chunk embeddings written by embed_faq.py."""
@@ -66,6 +80,9 @@ def embed_query(question: str) -> list[float]:
     questions and answers, which are phrased very differently, still end up
     close together in vector space.
     """
+    # A timeout matters here as much as error handling does - without one, a
+    # stalled connection would hang the whole bot forever on a single
+    # question instead of failing fast enough to recover.
     response = requests.post(
         EMBEDDINGS_URL,
         headers={
@@ -77,6 +94,7 @@ def embed_query(question: str) -> list[float]:
             "model": EMBEDDING_MODEL,
             "input_type": "query",
         },
+        timeout=30,
     )
     response.raise_for_status()
     return response.json()["data"][0]["embedding"]
@@ -159,8 +177,15 @@ def main():
         if not user_input:
             continue
 
-        scored_chunks = retrieve_relevant_chunks(user_input, chunks)
-        system_prompt = build_system_prompt(scored_chunks)
+        try:
+            scored_chunks = retrieve_relevant_chunks(user_input, chunks)
+        except requests.exceptions.RequestException as error:
+            # Covers connection failures, timeouts, and bad HTTP statuses
+            # (raise_for_status) from the Voyage embeddings call. Nothing
+            # was sent to Claude and no history was touched, so the user
+            # can just try again.
+            print(f"{Fore.RED}  [error embedding your question: {error}]{Style.RESET_ALL}\n")
+            continue
 
         # Visibility into retrieval - the FAQ is small and some chunks are a
         # single short line, so it's easy for the wrong chunk to win. Seeing
@@ -172,21 +197,49 @@ def main():
         )
         print(f"{Style.DIM}  [retrieved: {retrieved_summary}]{Style.RESET_ALL}")
 
+        best_similarity = scored_chunks[0][1]
+        if best_similarity < MIN_SIMILARITY:
+            # Even the closest FAQ chunk is a weak match, so the question is
+            # probably outside the FAQ entirely. Skip the Claude call rather
+            # than ask it to stretch irrelevant context into an answer, and
+            # don't add this exchange to history since nothing was actually
+            # answered.
+            print(
+                f"\n{Fore.GREEN}{Style.BRIGHT}{BOT_NAME.title()}:{Style.RESET_ALL} "
+                "I don't have that information in the FAQ.\n"
+            )
+            continue
+
+        system_prompt = build_system_prompt(scored_chunks)
         messages.append({"role": "user", "content": user_input})
 
-        response = client.messages.create(
-            model=CHAT_MODEL,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=messages,
-        )
+        print(f"\n{Fore.GREEN}{Style.BRIGHT}{BOT_NAME.title()}:{Style.RESET_ALL} ", end="")
+        try:
+            # Streaming prints the reply as it's generated instead of making
+            # the user stare at a blank prompt until the whole response is
+            # ready - most noticeable on longer answers.
+            with client.messages.stream(
+                model=CHAT_MODEL,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=messages,
+            ) as stream:
+                for text in stream.text_stream:
+                    print(text, end="", flush=True)
+                reply_text = stream.get_final_text()
+        except APIError as error:
+            # Covers auth failures, rate limits, connection drops, and
+            # server-side errors from the Claude call. Drop the user
+            # message we just appended so a failed turn doesn't leave a
+            # half-formed exchange in history.
+            messages.pop()
+            print(f"\n{Fore.RED}  [error getting a reply: {error}]{Style.RESET_ALL}\n")
+            continue
+        print("\n")
 
-        reply_text = next(
-            (block.text for block in response.content if block.type == "text"), ""
-        )
         messages.append({"role": "assistant", "content": reply_text})
-
-        print(f"\n{Fore.GREEN}{Style.BRIGHT}{BOT_NAME.title()}:{Style.RESET_ALL} {reply_text}\n")
+        # Trim to the most recent pairs so history can't grow without bound.
+        messages[:] = messages[-MAX_HISTORY_MESSAGES:]
 
 
 if __name__ == "__main__":
